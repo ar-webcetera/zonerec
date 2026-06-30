@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ZoneRec
+GenericName=Запись зоны экрана
+Comment=Выделить зону и записать видео по горячей клавише
+Exec=zonerec
+Icon=zonerec
+Terminal=false
+Categories=AudioVideo;Recorder;
+Keywords=screen;record;capture;screencast;запись;экран;
+X-GNOME-Autostart-enabled=true
