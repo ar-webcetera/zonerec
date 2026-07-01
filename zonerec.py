@@ -284,10 +284,11 @@ class RegionSelector(Gtk.Window):
         self.set_keep_above(True)
         self.move(self._root_x, self._root_y)
         self.resize(width, height)
-        self.set_events(
+        self.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK |
             Gdk.EventMask.BUTTON_RELEASE_MASK |
             Gdk.EventMask.POINTER_MOTION_MASK |
+            Gdk.EventMask.BUTTON1_MOTION_MASK |
             Gdk.EventMask.KEY_PRESS_MASK
         )
         visual = self.get_screen().get_rgba_visual()
@@ -305,9 +306,16 @@ class RegionSelector(Gtk.Window):
         if window is not None:
             cursor = Gdk.Cursor.new_from_name(Gdk.Display.get_default(), "crosshair")
             window.set_cursor(cursor)
+            seat = self.get_display().get_default_seat()
+            if seat:
+                seat.grab(window, Gdk.SeatCapabilities.ALL, True, None, None, None)
         self.present()
         self.grab_focus()
         self._loop.run()
+        if window is not None:
+            seat = self.get_display().get_default_seat()
+            if seat:
+                seat.ungrab()
         self.destroy()
         return self.result
 
@@ -570,10 +578,31 @@ def read_state():
             lines = f.read().splitlines()
         pid = int(lines[0])
         out = lines[1] if len(lines) > 1 else ""
-        os.kill(pid, 0)  # проверка, что процесс жив
+        if not pid_is_running(pid):
+            return None, None
         return pid, out
     except Exception:
         return None, None
+
+
+def _linux_pid_state(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            stat = f.read()
+    except OSError:
+        return None
+    end = stat.rfind(")")
+    if end == -1 or len(stat) <= end + 2:
+        return None
+    return stat[end + 2]
+
+
+def pid_is_running(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return _linux_pid_state(pid) != "Z"
 
 
 def write_state(pid, outfile):
@@ -632,6 +661,12 @@ def do_start():
     region = select_region()
     if region is None:
         return
+
+    # Принудительно очищаем события GTK, чтобы окно выделения успело закрыться
+    while Gtk.events_pending():
+        Gtk.main_iteration()
+    time.sleep(0.1)
+
     x, y, w, h = region
     w -= w % 2
     h -= h % 2
@@ -682,6 +717,10 @@ def do_start():
     write_state(proc.pid, outfile)
     notify("Запись пошла", "%dx%d, %s fps%s" % (w, h, g("fps"), notify_extra))
 
+    # Запускаем красную рамку, чтобы видеть, что именно пишется
+    subprocess.Popen([sys.argv[0], "--overlay", str(x), str(y), str(w), str(h)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def do_screenshot():
     if not shutil.which("ffmpeg"):
@@ -690,6 +729,12 @@ def do_screenshot():
     region = select_region()
     if region is None:
         return
+
+    # Принудительно очищаем события GTK, чтобы окно выделения успело закрыться
+    while Gtk.events_pending():
+        Gtk.main_iteration()
+    time.sleep(0.1)
+
     x, y, w, h = region
     cfg = load_config()
     g = lambda k: cfg.get("zonerec", k)
@@ -725,9 +770,7 @@ def do_stop():
     try:
         os.kill(pid, signal.SIGINT)  # корректное завершение mp4
         for _ in range(100):
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not pid_is_running(pid):
                 break
             time.sleep(0.1)
     except Exception:
@@ -846,6 +889,56 @@ def run_tray():
     Gtk.main()
 
 
+class RecordingOverlay(Gtk.Window):
+    def __init__(self, x, y, w, h):
+        Gtk.Window.__init__(self, type=Gtk.WindowType.POPUP)
+        self.set_app_paintable(True)
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_accept_focus(False)
+
+        import cairo
+        empty_region = cairo.Region()
+        self.input_shape_combine_region(empty_region)
+
+        self.b = 2
+        self.inner_w = w
+        self.inner_h = h
+        self.move(x - self.b, y - self.b)
+        self.resize(w + 2*self.b, h + 2*self.b)
+
+        visual = self.get_screen().get_rgba_visual()
+        if visual is not None:
+            self.set_visual(visual)
+
+        self.connect("draw", self._draw)
+
+    def _draw(self, widget, cr):
+        import cairo
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_source_rgba(0.72, 0.21, 0.15, 0.9)  # Красный акцент
+        cr.set_line_width(self.b)
+        # Отрисовка рамки точно вокруг зоны захвата без перекрытия видео
+        cr.rectangle(self.b / 2.0, self.b / 2.0, self.inner_w + self.b, self.inner_h + self.b)
+        cr.stroke()
+        return False
+
+def run_overlay(x, y, w, h):
+    overlay = RecordingOverlay(x, y, w, h)
+    overlay.show_all()
+    def check_alive():
+        if not is_recording():
+            Gtk.main_quit()
+            return False
+        return True
+    GLib.timeout_add_seconds(1, check_alive)
+    Gtk.main()
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -867,6 +960,8 @@ def main():
         do_screenshot()
     elif cmd in ("settings", "prefs", "preferences"):
         show_settings_dialog()
+    elif cmd == "overlay" and len(args) == 5:
+        run_overlay(int(args[1]), int(args[2]), int(args[3]), int(args[4]))
     else:
         sys.stderr.write("usage: zonerec [--start|--stop|--toggle|--screenshot|--settings]\n")
         sys.exit(2)

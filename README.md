@@ -30,7 +30,7 @@ ZoneRec — минималистичная утилита для Linux/X11: вы
 Скачайте `.deb` из GitHub Releases, перейдите в папку загрузки и установите:
 
 ```bash
-sudo apt install ./zonerec_0.1.8_all.deb
+sudo apt install ./zonerec_0.1.10_all.deb
 ```
 
 После установки ZoneRec появится в меню приложений и будет запускаться через иконку.
@@ -41,7 +41,7 @@ sudo apt install ./zonerec_0.1.8_all.deb
 
 ```bash
 ./build-deb.sh
-sudo apt install ./dist/zonerec_0.1.8_all.deb
+sudo apt install ./dist/zonerec_0.1.10_all.deb
 ```
 
 ### Локальная установка из исходников
