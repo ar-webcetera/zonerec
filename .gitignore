@@ -4,5 +4,6 @@ __pycache__/
 *.mkv
 *.webm
 .venv/
+.env
 build/
 dist/
