@@ -3,7 +3,7 @@
 set -euo pipefail
 
 APP=zonerec
-VERSION="${VERSION:-0.1.10}"
+VERSION="${VERSION:-0.1.11}"
 ARCH=all
 ROOT="build/${APP}_${VERSION}_${ARCH}"
 DEB="dist/${APP}_${VERSION}_${ARCH}.deb"
