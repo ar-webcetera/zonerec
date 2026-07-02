@@ -5,7 +5,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo ">> Системные зависимости (нужен sudo)"
 sudo apt update
-sudo apt install -y ffmpeg python3-gi gir1.2-gtk-3.0 \
+sudo apt install -y ffmpeg python3-gi gir1.2-gtk-3.0 gir1.2-gdkpixbuf-2.0 \
     gir1.2-keybinder-3.0 gir1.2-notify-0.7 libnotify-bin xdg-utils pulseaudio-utils
 # Индикатор в трее: один из двух пакетов (в зависимости от дистрибутива)
 sudo apt install -y gir1.2-appindicator3-0.1 \

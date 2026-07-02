@@ -35,7 +35,7 @@ Section: video
 Priority: optional
 Architecture: $ARCH
 Maintainer: Andrey Romanov
-Depends: ffmpeg, python3, python3-gi, gir1.2-gtk-3.0, gir1.2-keybinder-3.0, gir1.2-notify-0.7, libnotify-bin, xdg-utils, pulseaudio-utils, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
+Depends: ffmpeg, python3, python3-gi, gir1.2-gtk-3.0, gir1.2-gdkpixbuf-2.0, gir1.2-keybinder-3.0, gir1.2-notify-0.7, libnotify-bin, xdg-utils, pulseaudio-utils, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
 Description: Record a selected X11 screen area
  ZoneRec is a small tray utility for Linux/X11 that lets you select a screen
  area and record it to an MP4 file or screenshot using ffmpeg.
