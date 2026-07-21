@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import datetime
 import configparser
+import json
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -873,17 +874,32 @@ def show_settings_dialog(on_saved=None):
 
 
 # --- состояние записи (pidfile) ---
-def read_state():
+def read_recording_state():
     try:
         with open(STATE_PATH) as f:
-            lines = f.read().splitlines()
+            raw = f.read()
+        if raw.lstrip().startswith("{"):
+            state = json.loads(raw)
+            pid = int(state["pid"])
+            if not pid_is_running(pid):
+                return None
+            return state
+        lines = raw.splitlines()
         pid = int(lines[0])
         out = lines[1] if len(lines) > 1 else ""
         if not pid_is_running(pid):
-            return None, None
-        return pid, out
+            return None
+        return {"pid": pid, "outfile": out, "video_temp": out,
+                "audio_pids": [], "audio_temps": []}
     except Exception:
+        return None
+
+
+def read_state():
+    state = read_recording_state()
+    if state is None:
         return None, None
+    return int(state["pid"]), state.get("outfile", "")
 
 
 def _linux_pid_state(pid):
@@ -903,13 +919,27 @@ def pid_is_running(pid):
         os.kill(pid, 0)
     except OSError:
         return False
-    return _linux_pid_state(pid) != "Z"
+    if _linux_pid_state(pid) == "Z":
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (OSError, ChildProcessError):
+            pass
+        return False
+    return True
 
 
-def write_state(pid, outfile):
+def write_state(pid, outfile, video_temp=None, audio_pids=None, audio_temps=None):
     os.makedirs(CACHE_DIR, exist_ok=True)
+    state = {
+        "pid": pid,
+        "outfile": outfile,
+        "video_temp": video_temp or outfile,
+        "audio_pids": audio_pids or [],
+        "audio_temps": audio_temps or [],
+    }
     with open(STATE_PATH, "w") as f:
-        f.write("%d\n%s\n" % (pid, outfile))
+        json.dump(state, f)
+        f.write("\n")
 
 
 def clear_state():
@@ -1012,23 +1042,34 @@ def do_start():
     if mode == "both" and len(srcs) < 2:
         notify("Не выбраны источники аудио", "Откройте настройки ZoneRec")
         return
-    cmd = ["ffmpeg", "-y", "-f", "x11grab", "-framerate", g("fps"),
-           "-video_size", "%dx%d" % (w, h), "-i", "%s+%d,%d" % (display, x, y)]
-    for s in srcs:
-        cmd += ["-f", "pulse", "-i", s]
-    cmd += ["-c:v", "libx264", "-preset", g("preset"), "-pix_fmt", "yuv420p"]
-    if len(srcs) == 1:
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
-    elif len(srcs) >= 2:
-        cmd += ["-filter_complex",
-                "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[a]",
-                "-map", "0:v", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
-    cmd += [outfile]
+    # Экран и каждый Pulse-источник пишутся отдельными процессами. ffmpeg
+    # открывает входы последовательно, поэтому единый процесс накапливал кадры
+    # в очереди, пока USB-микрофон инициализировался, и ролик шёл рывками.
+    base = os.path.splitext(outfile)[0]
+    video_temp = base + ".video.mp4" if srcs else outfile
+    audio_temps = [base + ".audio%d.m4a" % (i + 1) for i in range(len(srcs))]
+    audio_procs = []
+    for source, audio_temp in zip(srcs, audio_temps):
+        audio_cmd = [
+            "ffmpeg", "-y", "-thread_queue_size", "64", "-f", "pulse",
+            "-i", source, "-c:a", "aac", "-b:a", "128k", audio_temp,
+        ]
+        audio_procs.append(subprocess.Popen(
+            audio_cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+    cmd = [
+        "ffmpeg", "-y", "-thread_queue_size", "64", "-f", "x11grab",
+        "-framerate", g("fps"), "-video_size", "%dx%d" % (w, h),
+        "-i", "%s+%d,%d" % (display, x, y), "-c:v", "libx264",
+        "-preset", g("preset"), "-pix_fmt", "yuv420p", video_temp,
+    ]
     notify_extra = {"none": "", "mic": " + микрофон", "system": " + звук ПК",
                     "both": " + звук+микрофон"}.get(mode, " + звук") if srcs else ""
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    write_state(proc.pid, outfile)
+    write_state(proc.pid, outfile, video_temp,
+                [p.pid for p in audio_procs], audio_temps)
     notify("Запись пошла", "%dx%d, %s fps%s" % (w, h, g("fps"), notify_extra))
 
     # Запускаем красную рамку, чтобы видеть, что именно пишется
@@ -1079,19 +1120,88 @@ def do_screenshot():
         notify("Скриншот сохранён", "Не удалось скопировать в буфер")
 
 
+def media_duration(path):
+    try:
+        value = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        return float(value)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return 0.0
+
+
+def mux_recording(video_path, audio_paths, outfile):
+    video_duration = media_duration(video_path)
+    if video_duration <= 0 or not audio_paths:
+        return False
+    cmd = ["ffmpeg", "-y", "-i", video_path]
+    for audio_path in audio_paths:
+        cmd += ["-i", audio_path]
+
+    filters = []
+    padded = []
+    for index, audio_path in enumerate(audio_paths, 1):
+        audio_duration = media_duration(audio_path)
+        if audio_duration <= 0:
+            return False
+        label = "a%d" % index
+        # Pulse и X11 стартуют почти одновременно, но Pulse раньше перестаёт
+        # отдавать буфер при SIGINT. Выравниваем дорожки по началу, а недостающий
+        # хвост дополняем тишиной. Сдвиг тишины в начало задерживал весь звук.
+        filters.append("[%d:a]apad[%s]" % (index, label))
+        padded.append("[%s]" % label)
+    if len(padded) == 1:
+        audio_label = padded[0]
+    else:
+        filters.append("%samix=inputs=%d:duration=longest:dropout_transition=0[a]" %
+                       ("".join(padded), len(padded)))
+        audio_label = "[a]"
+    cmd += ["-filter_complex", ";".join(filters),
+            "-map", "0:v", "-map", audio_label,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            "-t", "%.3f" % video_duration, "-movflags", "+faststart", outfile]
+    try:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
 def do_stop():
-    pid, outfile = read_state()
-    if pid is None:
+    state = read_recording_state()
+    if state is None:
         notify("Сейчас ничего не записывается")
         return
+    pid = int(state["pid"])
+    outfile = state.get("outfile", "")
+    audio_pids = [int(p) for p in state.get("audio_pids", [])]
+    pids = [pid] + audio_pids
     try:
-        os.kill(pid, signal.SIGINT)  # корректное завершение mp4
-        for _ in range(100):
-            if not pid_is_running(pid):
+        for current_pid in pids:
+            try:
+                os.kill(current_pid, signal.SIGINT)
+            except OSError:
+                pass
+        for _ in range(200):
+            if not any(pid_is_running(current_pid) for current_pid in pids):
                 break
             time.sleep(0.1)
     except Exception:
         pass
+    audio_temps = state.get("audio_temps", [])
+    video_temp = state.get("video_temp", outfile)
+    if audio_temps:
+        if not mux_recording(video_temp, audio_temps, outfile):
+            clear_state()
+            notify("Не удалось собрать запись", "Временные файлы сохранены рядом с видео")
+            return
+        for temp_path in [video_temp] + audio_temps:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
     clear_state()
     notify("Запись сохранена", os.path.basename(outfile or ""))
 
@@ -1206,7 +1316,7 @@ def run_tray():
     Gtk.main()
 
 
-class RecordingOverlay(Gtk.Window):
+class RecordingBorder(Gtk.Window):
     def __init__(self, x, y, w, h):
         Gtk.Window.__init__(self, type=Gtk.WindowType.POPUP)
         self.set_app_paintable(True)
@@ -1218,11 +1328,8 @@ class RecordingOverlay(Gtk.Window):
         empty_region = cairo.Region()
         self.input_shape_combine_region(empty_region)
 
-        self.b = 2
-        self.inner_w = w
-        self.inner_h = h
-        self.move(x - self.b, y - self.b)
-        self.resize(w + 2*self.b, h + 2*self.b)
+        self.move(x, y)
+        self.resize(w, h)
 
         visual = self.get_screen().get_rgba_visual()
         if visual is not None:
@@ -1233,20 +1340,38 @@ class RecordingOverlay(Gtk.Window):
     def _draw(self, widget, cr):
         import cairo
         cr.set_operator(cairo.OPERATOR_SOURCE)
-        cr.set_source_rgba(0, 0, 0, 0)
+        cr.set_source_rgba(0.72, 0.21, 0.15, 0.9)
         cr.paint()
-
-        cr.set_operator(cairo.OPERATOR_OVER)
-        cr.set_source_rgba(0.72, 0.21, 0.15, 0.9)  # Красный акцент
-        cr.set_line_width(self.b)
-        # Отрисовка рамки точно вокруг зоны захвата без перекрытия видео
-        cr.rectangle(self.b / 2.0, self.b / 2.0, self.inner_w + self.b, self.inner_h + self.b)
-        cr.stroke()
         return False
 
+
 def run_overlay(x, y, w, h):
-    overlay = RecordingOverlay(x, y, w, h)
-    overlay.show_all()
+    # Нельзя использовать одно прозрачное окно размером с область записи:
+    # некоторые X11-композиторы замораживают находящееся под ним изображение,
+    # и x11grab получает один и тот же кадр. Четыре узких окна не перекрывают
+    # захватываемые пиксели вообще.
+    border = 2
+    root_x, root_y, screen_w, screen_h = _root_geometry()
+    screen_right = root_x + screen_w
+    screen_bottom = root_y + screen_h
+    rects = (
+        (max(root_x, x - border), max(root_y, y - border),
+         min(screen_right, x + w + border) - max(root_x, x - border),
+         min(border, max(0, y - root_y))),
+        (max(root_x, x - border), y + h,
+         min(screen_right, x + w + border) - max(root_x, x - border),
+         min(border, max(0, screen_bottom - (y + h)))),
+        (max(root_x, x - border), y, min(border, max(0, x - root_x)), h),
+        (x + w, y, min(border, max(0, screen_right - (x + w))), h),
+    )
+    overlays = []
+    for bx, by, bw, bh in rects:
+        if bw <= 0 or bh <= 0:
+            continue
+        overlay = RecordingBorder(bx, by, bw, bh)
+        overlay.show_all()
+        overlays.append(overlay)
+
     def check_alive():
         if not is_recording():
             Gtk.main_quit()
